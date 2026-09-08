@@ -21,6 +21,13 @@ function anthropicImageUrl(source: any): string | null {
   return null;
 }
 
+// OpenAI image_url url -> Anthropic image block. data: URIs become a base64 source; other urls a url source.
+function openAIImageBlock(url: string): any {
+  const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+  if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
+  return { type: "image", source: { type: "url", url } };
+}
+
 /**
  * Convert Anthropic messages to OpenAI format for compression.
  *
@@ -128,6 +135,7 @@ function openAIToAnthropic(messages: OpenAIMessage[]): any[] {
           role: "user",
           content: msg.content.map((p) => {
             if (p.type === "text") return { type: "text", text: p.text };
+            if (p.type === "image_url") return openAIImageBlock(p.image_url.url);
             return { type: "text", text: "" };
           }),
         });

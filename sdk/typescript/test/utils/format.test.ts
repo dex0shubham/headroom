@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { vercelToOpenAI, openAIToVercel, anthropicToOpenAI } from "../../src/utils/format.js";
+import { vercelToOpenAI, openAIToVercel, anthropicToOpenAI, openAIToAnthropic } from "../../src/utils/format.js";
 import type { OpenAIMessage } from "../../src/types.js";
 
 describe("vercelToOpenAI", () => {
@@ -366,6 +366,91 @@ describe("anthropicToOpenAI", () => {
       { role: "user", content: [{ type: "image", source: { type: "unknown" } }] },
     ]);
     expect(result).toEqual([]);
+  });
+});
+
+describe("openAIToAnthropic", () => {
+  it("converts a base64 image_url part back to an Anthropic base64 image block", () => {
+    const result = openAIToAnthropic([
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "data:image/png;base64,ABC" } },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "ABC" } },
+        ],
+      },
+    ]);
+  });
+
+  it("converts an http(s) image_url part back to an Anthropic url image block", () => {
+    const result = openAIToAnthropic([
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "url", url: "https://example.com/cat.png" } },
+        ],
+      },
+    ]);
+  });
+
+  it("preserves order of text + image_url parts", () => {
+    const result = openAIToAnthropic([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image_url", image_url: { url: "data:image/jpeg;base64,BBBB" } },
+        ],
+      },
+    ]);
+    expect(result[0].content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "BBBB" } },
+    ]);
+  });
+});
+
+describe("round-trip: anthropicToOpenAI then openAIToAnthropic", () => {
+  it("preserves an image-only turn", () => {
+    const original = [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+        ],
+      },
+    ];
+    const result = openAIToAnthropic(anthropicToOpenAI(original));
+    expect(result).toEqual(original);
+  });
+
+  it("preserves a mixed text + image turn, in order", () => {
+    const original = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "BBBB" } },
+        ],
+      },
+    ];
+    const result = openAIToAnthropic(anthropicToOpenAI(original));
+    expect(result).toEqual(original);
   });
 });
 
