@@ -72,8 +72,13 @@ export interface CompressOptions {
 }
 
 export interface CompressResult {
-  /** Compressed messages in the same format as input. */
-  messages: OpenAIMessage[];
+  /**
+   * Compressed messages in the same format as input. Typed `any[]` because the
+   * universal `compress()` returns messages in the *input* format — it calls
+   * `fromOpenAI(messages, inputFormat)`, so for Anthropic/Vercel/Gemini input
+   * these are not OpenAI-shaped. See the note on `HeadroomClient.compress`.
+   */
+  messages: any[];
   tokensBefore: number;
   tokensAfter: number;
   tokensSaved: number;
