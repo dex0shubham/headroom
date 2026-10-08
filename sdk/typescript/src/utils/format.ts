@@ -236,6 +236,80 @@ export function openAIToAnthropic(messages: OpenAIMessage[]): any[] {
 // Vercel AI SDK → OpenAI
 // ============================================================
 
+function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function parseUrl(value: string): URL | null {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+type VercelMediaImageUrl = { url: string; media_type?: string; part?: "file"; filename?: string };
+
+// Vercel `image` / `file` part -> OpenAI image_url object, or null if the data is unconvertible
+// (e.g. a provider file reference). Bytes and base64 travel as a data: URI, which carries the
+// media type; URLs stay URLs with the media type on a private `media_type` key. `part: "file"`
+// and `filename` are carried so the reverse conversion rebuilds the right part. The proxy
+// passes non-text parts through unchanged, so the private keys survive /v1/compress.
+function vercelMediaImageUrl(p: any): VercelMediaImageUrl | null {
+  const data = p.type === "file" ? p.data : p.image;
+  const mediaType: string | undefined = typeof p.mediaType === "string" ? p.mediaType : p.mimeType;
+  let url: string | null = null;
+  let carryType = false;
+  if (data instanceof Uint8Array || data instanceof ArrayBuffer) {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    url = `data:${mediaType ?? ""};base64,${bytesToBase64(bytes)}`;
+  } else if (data instanceof URL) {
+    url = data.toString();
+    carryType = true;
+  } else if (typeof data === "string") {
+    if (data.startsWith("data:")) url = data;
+    else if (parseUrl(data)) {
+      url = data;
+      carryType = true;
+    } else url = `data:${mediaType ?? ""};base64,${data}`;
+  }
+  if (url === null) return null;
+  const out: VercelMediaImageUrl = { url };
+  if (carryType && mediaType) out.media_type = mediaType;
+  if (p.type === "file") out.part = "file";
+  if (typeof p.filename === "string") out.filename = p.filename;
+  return out;
+}
+
+// OpenAI image_url -> Vercel `image` or `file` part. A data: URI yields base64 data plus its
+// media type; an http(s) url yields a URL object; anything else stays a string. Never throws.
+function vercelMediaPart(imageUrl: any): any {
+  const url: string = imageUrl.url;
+  const m = /^data:([^;,]*);base64,(.*)$/s.exec(url);
+  let data: any;
+  let mediaType: string | undefined = typeof imageUrl.media_type === "string" ? imageUrl.media_type : undefined;
+  if (m) {
+    data = m[2];
+    if (m[1]) mediaType = m[1];
+  } else {
+    data = parseUrl(url) ?? url;
+  }
+  const isFile = imageUrl.part === "file" || (mediaType !== undefined && !mediaType.startsWith("image/"));
+  if (isFile) {
+    const part: any = { type: "file", mediaType: mediaType ?? "application/octet-stream", data };
+    if (typeof imageUrl.filename === "string") part.filename = imageUrl.filename;
+    return part;
+  }
+  const part: any = { type: "image", image: data };
+  if (mediaType) part.mediaType = mediaType;
+  return part;
+}
+
 export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
@@ -252,21 +326,19 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
       }
       const parts = Array.isArray(msg.content) ? msg.content : [];
       const textParts = parts.filter((p: any) => p.type === "text");
-      const imageParts = parts.filter((p: any) => p.type === "image");
+      const mediaParts = parts.filter((p: any) => p.type === "image" || p.type === "file");
 
-      if (imageParts.length === 0 && textParts.length > 0) {
+      if (mediaParts.length === 0 && textParts.length > 0) {
         result.push({ role: "user", content: textParts.map((p: any) => p.text).join("") });
       } else {
         const openaiParts = parts
-          .filter((p: any) => p.type === "text" || p.type === "image")
+          .filter((p: any) => p.type === "text" || p.type === "image" || p.type === "file")
           .map((p: any) => {
             if (p.type === "text") return { type: "text" as const, text: p.text };
-            if (p.type === "image") {
-              const url = p.image instanceof URL ? p.image.toString() : String(p.image);
-              return { type: "image_url" as const, image_url: { url } };
-            }
-            return { type: "text" as const, text: "" };
-          });
+            const imageUrl = vercelMediaImageUrl(p);
+            return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
+          })
+          .filter((p: any): p is NonNullable<typeof p> => p !== null);
         result.push({ role: "user", content: openaiParts });
       }
       continue;
@@ -343,7 +415,7 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
       } else if (Array.isArray(msg.content)) {
         const parts = msg.content.map((p) => {
           if (p.type === "text") return { type: "text", text: p.text };
-          if (p.type === "image_url") return { type: "image", image: new URL(p.image_url.url) };
+          if (p.type === "image_url") return vercelMediaPart(p.image_url);
           return { type: "text", text: "" };
         });
         result.push({ role: "user", content: parts });

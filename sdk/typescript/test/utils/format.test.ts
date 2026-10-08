@@ -838,3 +838,152 @@ describe("openAIToVercel tool names", () => {
   });
 });
 
+describe("vercelToOpenAI media parts", () => {
+  it("converts a provider-prompt file part (image bytes) to an image_url data URI", () => {
+    const result = vercelToOpenAI([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file" } },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps a file-only turn (pdf) and carries its filename", () => {
+    const result = vercelToOpenAI([
+      { role: "user", content: [{ type: "file", mediaType: "application/pdf", data: "JVBERi0=", filename: "a.pdf" }] },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "data:application/pdf;base64,JVBERi0=", part: "file", filename: "a.pdf" } },
+        ],
+      },
+    ]);
+  });
+
+  it("encodes a Uint8Array image as a data URI instead of String(bytes)", () => {
+    const result = vercelToOpenAI([
+      { role: "user", content: [{ type: "image", image: new Uint8Array([137, 80, 78, 71]), mediaType: "image/png" }] },
+    ]);
+    expect(result).toEqual([
+      { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } }] },
+    ]);
+  });
+
+  it("treats a bare base64 string image as data, not a URL", () => {
+    const result = vercelToOpenAI([
+      { role: "user", content: [{ type: "image", image: "iVBORw==", mediaType: "image/png" }] },
+    ]);
+    expect(result).toEqual([
+      { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } }] },
+    ]);
+  });
+
+  it("carries the media type of a URL-backed file part", () => {
+    const result = vercelToOpenAI([
+      { role: "user", content: [{ type: "file", mediaType: "application/pdf", data: new URL("https://example.com/a.pdf") }] },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "https://example.com/a.pdf", part: "file", media_type: "application/pdf" } },
+        ],
+      },
+    ]);
+  });
+});
+
+describe("openAIToVercel media parts", () => {
+  it("restores a data URI marked part=file as a file part with base64 data", () => {
+    const msgs = [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "data:application/pdf;base64,JVBERi0=", part: "file", filename: "a.pdf" } },
+        ],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToVercel(msgs)).toEqual([
+      { role: "user", content: [{ type: "file", mediaType: "application/pdf", data: "JVBERi0=", filename: "a.pdf" }] },
+    ]);
+  });
+
+  it("restores an image data URI as an image part with base64 data and mediaType", () => {
+    const msgs: OpenAIMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==" } }] },
+    ];
+    expect(openAIToVercel(msgs)).toEqual([
+      { role: "user", content: [{ type: "image", image: "iVBORw==", mediaType: "image/png" }] },
+    ]);
+  });
+
+  it("restores a URL-backed file part from the carried media type", () => {
+    const msgs = [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "https://example.com/a.pdf", part: "file", media_type: "application/pdf" } },
+        ],
+      },
+    ] as OpenAIMessage[];
+    const part = openAIToVercel(msgs)[0].content[0];
+    expect(part.type).toBe("file");
+    expect(part.mediaType).toBe("application/pdf");
+    expect(part.data).toBeInstanceOf(URL);
+    expect(part.data.toString()).toBe("https://example.com/a.pdf");
+  });
+
+  it("never throws on an unparseable url and keeps it as a string", () => {
+    const msgs: OpenAIMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: "137,80,78,71" } }] },
+    ];
+    expect(() => openAIToVercel(msgs)).not.toThrow();
+    expect(openAIToVercel(msgs)[0].content[0]).toEqual({ type: "image", image: "137,80,78,71" });
+  });
+});
+
+describe("round-trip: vercelToOpenAI then openAIToVercel (media)", () => {
+  it("round-trips a provider-prompt text+file turn into a valid file part", () => {
+    const original = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+        ],
+      },
+    ];
+    expect(openAIToVercel(vercelToOpenAI(original))).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "file", mediaType: "image/png", data: "iVBORw==" },
+        ],
+      },
+    ]);
+  });
+
+  it("round-trips a byte image without throwing", () => {
+    const original = [
+      { role: "user", content: [{ type: "image", image: new Uint8Array([137, 80, 78, 71]), mediaType: "image/png" }] },
+    ];
+    expect(openAIToVercel(vercelToOpenAI(original))).toEqual([
+      { role: "user", content: [{ type: "image", image: "iVBORw==", mediaType: "image/png" }] },
+    ]);
+  });
+});
