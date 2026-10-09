@@ -53,6 +53,12 @@ export function detectFormat(messages: any[]): MessageFormat {
         if (part.type === "tool_use" || part.type === "tool_result") return "anthropic";
         // Anthropic: image with source.type
         if (part.type === "image" && part.source?.type) return "anthropic";
+        // Vercel: `file` parts carry data/mediaType (OpenAI's `file` part carries a `file` object);
+        // `image` parts carry `image` (Anthropic's carry `source`)
+        if (part && typeof part === "object") {
+          if (part.type === "file" && ("data" in part || "mediaType" in part)) return "vercel";
+          if (part.type === "image" && "image" in part) return "vercel";
+        }
       }
     }
   }
@@ -200,7 +206,8 @@ export function openAIToAnthropic(messages: OpenAIMessage[]): any[] {
 
     if (msg.role === "assistant") {
       const blocks: any[] = [];
-      if (msg.content) blocks.push({ type: "text", text: msg.content });
+      const text = assistantText(msg.content);
+      if (text) blocks.push({ type: "text", text });
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           blocks.push({
@@ -310,6 +317,17 @@ function vercelMediaPart(imageUrl: any): any {
   return part;
 }
 
+// Assistant text for converters whose assistant turns carry no media (Anthropic, Gemini): joins
+// the text parts of an array-shaped content; media parts are not representable there.
+function assistantText(content: AssistantMessage["content"]): string | null {
+  if (typeof content === "string") return content || null;
+  if (Array.isArray(content)) {
+    const text = content.filter((p) => p.type === "text").map((p) => (p as any).text).join("\n");
+    return text || null;
+  }
+  return null;
+}
+
 export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
@@ -352,8 +370,22 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
       const parts = Array.isArray(msg.content) ? msg.content : [];
       const textParts = parts.filter((p: any) => p.type === "text");
       const toolCallParts = parts.filter((p: any) => p.type === "tool-call");
+      const hasFiles = parts.some((p: any) => p.type === "file");
 
-      const content = textParts.length > 0 ? textParts.map((p: any) => p.text).join("") : null;
+      let content: AssistantMessage["content"];
+      if (hasFiles) {
+        // AI SDK assistant content may carry generated files; keep them as ordered parts.
+        content = parts
+          .filter((p: any) => p.type === "text" || p.type === "file")
+          .map((p: any) => {
+            if (p.type === "text") return { type: "text" as const, text: p.text };
+            const imageUrl = vercelMediaImageUrl(p);
+            return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
+          })
+          .filter((p: any): p is NonNullable<typeof p> => p !== null);
+      } else {
+        content = textParts.length > 0 ? textParts.map((p: any) => p.text).join("") : null;
+      }
       const openaiMsg: AssistantMessage = { role: "assistant", content };
 
       if (toolCallParts.length > 0) {
@@ -425,7 +457,14 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
 
     if (msg.role === "assistant") {
       const parts: any[] = [];
-      if (msg.content) parts.push({ type: "text", text: msg.content });
+      if (typeof msg.content === "string") {
+        if (msg.content) parts.push({ type: "text", text: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        for (const p of msg.content) {
+          if (p.type === "text") parts.push({ type: "text", text: p.text });
+          else if (p.type === "image_url") parts.push(vercelMediaPart(p.image_url));
+        }
+      }
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           toolNames.set(tc.id, tc.function.name);
@@ -605,7 +644,8 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
 
     if (msg.role === "assistant") {
       const parts: any[] = [];
-      if (msg.content) parts.push({ text: msg.content });
+      const text = assistantText(msg.content);
+      if (text) parts.push({ text });
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           parts.push({

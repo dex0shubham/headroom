@@ -987,3 +987,74 @@ describe("round-trip: vercelToOpenAI then openAIToVercel (media)", () => {
     ]);
   });
 });
+
+describe("vercelToOpenAI / openAIToVercel assistant file parts", () => {
+  it("keeps an assistant file part (generated image) alongside its text", () => {
+    const result = vercelToOpenAI([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]), filename: "cat.png" },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file", filename: "cat.png" } },
+        ],
+      },
+    ]);
+  });
+
+  it("restores an assistant content array as text and file parts with the assistant role", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw==", part: "file", filename: "cat.png" } },
+        ],
+      },
+    ] as OpenAIMessage[];
+    expect(openAIToVercel(msgs)).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "file", mediaType: "image/png", data: "iVBORw==", filename: "cat.png" },
+        ],
+      },
+    ]);
+  });
+
+  it("round-trips an assistant text+file turn", () => {
+    const original = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "file", mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) },
+        ],
+      },
+    ];
+    expect(openAIToVercel(vercelToOpenAI(original))).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "generated image" },
+          { type: "file", mediaType: "image/png", data: "iVBORw==" },
+        ],
+      },
+    ]);
+  });
+
+  it("leaves text-only assistant turns as a string (backward compat)", () => {
+    expect(
+      vercelToOpenAI([{ role: "assistant", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] }]),
+    ).toEqual([{ role: "assistant", content: "ab" }]);
+  });
+});
