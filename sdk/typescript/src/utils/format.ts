@@ -94,6 +94,40 @@ function openAIImageBlock(url: string): any {
   return { type: "image", source: { type: "url", url } };
 }
 
+// Anthropic media block -> OpenAI image_url object, or null if unconvertible: image blocks via
+// anthropicImageUrl; document blocks (PDF) as a data: URI, or a url with the MIME type carried on
+// the private `mime_type` key.
+function anthropicMediaImageUrl(block: any): { url: string; mime_type?: string } | null {
+  if (block.type === "image") {
+    const url = anthropicImageUrl(block.source);
+    return url ? { url } : null;
+  }
+  if (block.type === "document" && block.source && typeof block.source === "object") {
+    const src = block.source;
+    if (src.type === "base64" && src.media_type && src.data) {
+      return { url: `data:${src.media_type};base64,${src.data}` };
+    }
+    if (src.type === "url" && typeof src.url === "string") return { url: src.url, mime_type: "application/pdf" };
+  }
+  return null;
+}
+
+// OpenAI image_url -> Anthropic media block, or null when Anthropic has no block for that media:
+// image/* (or unknown) -> image block; application/pdf -> document block (base64 or url source).
+function anthropicMediaBlock(imageUrl: any): any {
+  const url: string = imageUrl.url;
+  const m = /^data:([^;,]*);base64,(.*)$/s.exec(url);
+  const mediaType: string | undefined =
+    (m && m[1]) || (typeof imageUrl.mime_type === "string" ? imageUrl.mime_type : undefined);
+  if (mediaType === "application/pdf") {
+    return m
+      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: m[2] } }
+      : { type: "document", source: { type: "url", url } };
+  }
+  if (mediaType === undefined || mediaType.startsWith("image/")) return openAIImageBlock(url);
+  return null;
+}
+
 export function anthropicToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
@@ -153,10 +187,22 @@ export function anthropicToOpenAI(messages: any[]): OpenAIMessage[] {
       if (Array.isArray(msg.content)) {
         const textBlocks = msg.content.filter((b: any) => b.type === "text");
         const toolUseBlocks = msg.content.filter((b: any) => b.type === "tool_use");
+        const hasMedia = msg.content.some((b: any) => b.type === "image" || b.type === "document");
 
-        const content = textBlocks.length > 0
-          ? textBlocks.map((b: any) => b.text).join("\n")
-          : null;
+        let content: AssistantMessage["content"];
+        if (hasMedia) {
+          // Keep generated media as ordered parts (see AssistantMessage.content).
+          content = msg.content
+            .filter((b: any) => b.type === "text" || b.type === "image" || b.type === "document")
+            .map((b: any) => {
+              if (b.type === "text") return { type: "text" as const, text: b.text };
+              const imageUrl = anthropicMediaImageUrl(b);
+              return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
+            })
+            .filter((p: any): p is NonNullable<typeof p> => p !== null);
+        } else {
+          content = textBlocks.length > 0 ? textBlocks.map((b: any) => b.text).join("\n") : null;
+        }
 
         const openaiMsg: AssistantMessage = { role: "assistant", content };
         if (toolUseBlocks.length > 0) {
@@ -196,7 +242,7 @@ export function openAIToAnthropic(messages: OpenAIMessage[]): any[] {
           role: "user",
           content: msg.content.map((p) => {
             if (p.type === "text") return { type: "text", text: p.text };
-            if (p.type === "image_url") return openAIImageBlock(p.image_url.url);
+            if (p.type === "image_url") return anthropicMediaBlock(p.image_url) ?? { type: "text", text: "" };
             return { type: "text", text: "" };
           }),
         });
@@ -206,8 +252,17 @@ export function openAIToAnthropic(messages: OpenAIMessage[]): any[] {
 
     if (msg.role === "assistant") {
       const blocks: any[] = [];
-      const text = assistantText(msg.content);
-      if (text) blocks.push({ type: "text", text });
+      if (typeof msg.content === "string") {
+        if (msg.content) blocks.push({ type: "text", text: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        for (const p of msg.content) {
+          if (p.type === "text") blocks.push({ type: "text", text: p.text });
+          else if (p.type === "image_url") {
+            const block = anthropicMediaBlock(p.image_url);
+            if (block) blocks.push(block);
+          }
+        }
+      }
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           blocks.push({
@@ -260,11 +315,11 @@ function parseUrl(value: string): URL | null {
   }
 }
 
-type VercelMediaImageUrl = { url: string; media_type?: string; part?: "file"; filename?: string };
+type VercelMediaImageUrl = { url: string; mime_type?: string; part?: "file"; filename?: string };
 
 // Vercel `image` / `file` part -> OpenAI image_url object, or null if the data is unconvertible
 // (e.g. a provider file reference). Bytes and base64 travel as a data: URI, which carries the
-// media type; URLs stay URLs with the media type on a private `media_type` key. `part: "file"`
+// media type; URLs stay URLs with the media type on a private `mime_type` key. `part: "file"`
 // and `filename` are carried so the reverse conversion rebuilds the right part. The proxy
 // passes non-text parts through unchanged, so the private keys survive /v1/compress.
 function vercelMediaImageUrl(p: any): VercelMediaImageUrl | null {
@@ -287,7 +342,7 @@ function vercelMediaImageUrl(p: any): VercelMediaImageUrl | null {
   }
   if (url === null) return null;
   const out: VercelMediaImageUrl = { url };
-  if (carryType && mediaType) out.media_type = mediaType;
+  if (carryType && mediaType) out.mime_type = mediaType;
   if (p.type === "file") out.part = "file";
   if (typeof p.filename === "string") out.filename = p.filename;
   return out;
@@ -299,7 +354,7 @@ function vercelMediaPart(imageUrl: any): any {
   const url: string = imageUrl.url;
   const m = /^data:([^;,]*);base64,(.*)$/s.exec(url);
   let data: any;
-  let mediaType: string | undefined = typeof imageUrl.media_type === "string" ? imageUrl.media_type : undefined;
+  let mediaType: string | undefined = typeof imageUrl.mime_type === "string" ? imageUrl.mime_type : undefined;
   if (m) {
     data = m[2];
     if (m[1]) mediaType = m[1];
@@ -315,17 +370,6 @@ function vercelMediaPart(imageUrl: any): any {
   const part: any = { type: "image", image: data };
   if (mediaType) part.mediaType = mediaType;
   return part;
-}
-
-// Assistant text for converters whose assistant turns carry no media (Anthropic, Gemini): joins
-// the text parts of an array-shaped content; media parts are not representable there.
-function assistantText(content: AssistantMessage["content"]): string | null {
-  if (typeof content === "string") return content || null;
-  if (Array.isArray(content)) {
-    const text = content.filter((p) => p.type === "text").map((p) => (p as any).text).join("\n");
-    return text || null;
-  }
-  return null;
 }
 
 export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
@@ -591,8 +635,22 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
     if (role === "assistant") {
       const textParts = parts.filter((p: any) => p.text !== undefined);
       const funcCalls = parts.filter((p: any) => p.functionCall);
+      const hasMedia = parts.some((p: any) => p.inlineData || p.fileData);
 
-      const content = textParts.length > 0 ? textParts.map((p: any) => p.text).join("\n") : null;
+      let content: AssistantMessage["content"];
+      if (hasMedia) {
+        // Keep generated media (e.g. image output) as ordered parts.
+        content = parts
+          .filter((p: any) => p.text !== undefined || p.inlineData || p.fileData)
+          .map((p: any) => {
+            if (p.text !== undefined) return { type: "text" as const, text: p.text };
+            const imageUrl = geminiMediaImageUrl(p);
+            return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
+          })
+          .filter((p: any): p is NonNullable<typeof p> => p !== null);
+      } else {
+        content = textParts.length > 0 ? textParts.map((p: any) => p.text).join("\n") : null;
+      }
       const openaiMsg: AssistantMessage = { role: "assistant", content };
 
       if (funcCalls.length > 0) {
@@ -644,8 +702,14 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
 
     if (msg.role === "assistant") {
       const parts: any[] = [];
-      const text = assistantText(msg.content);
-      if (text) parts.push({ text });
+      if (typeof msg.content === "string") {
+        if (msg.content) parts.push({ text: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        for (const p of msg.content) {
+          if (p.type === "text") parts.push({ text: p.text });
+          else if (p.type === "image_url") parts.push(geminiMediaPart(p.image_url));
+        }
+      }
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           parts.push({
